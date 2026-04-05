@@ -1,6 +1,8 @@
 Please see the Astronalyze_User_Guide.md for a complete guide to using this tool
 
-To install, download Astronalyze.zip to a folder on your hard drive.  Right-click and select Extract All...
+To install, download Astronalyze.zip from the release olfer below to a folder on your hard drive.  Right-click and select Extract All...
+https://github.com/ricksastro/Astronalyze/releases/tag/v1.0.0
+
 This will create an Astronalyze folder with Astronalyze.exe in it as well as other support files.   No need to install anything!
 
 You can run Astronalyze.exe by double clicking on it.  Open a directory containing with FITS ot Pixinsight XISF files and the directory list on the right will populate and the top file will be displayed.
