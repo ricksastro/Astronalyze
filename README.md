@@ -6,7 +6,8 @@ https://github.com/ricksastro/Astronalyze/releases/tag/v1.0.0
 
 This will create an Astronalyze folder with Astronalyze.exe in it as well as other support files.   No need to install anything!
 
-You can run Astronalyze.exe by double clicking on it.  Open a directory containing FITS or Pixinsight XISF image files and the directory list on the right will populate and the top file will be displayed.
+You can run Astronalyze.exe by double clicking on it.  Note that the first time you run it, it may take several seconds to come up.
+Open a directory containing FITS or Pixinsight XISF image files and the directory list on the right will populate and the top file will be displayed.
 From there, soo the users guide for all the options, or just click around and try it.
 
 Note, the sort FWHM and Stars rely on a specific naming convention in the file name.  I have NINA embed them in my names (..._fwhm4.5_... and ..._stars456_...).   
