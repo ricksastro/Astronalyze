@@ -1,0 +1,15 @@
+# PyInstaller build output
+build/
+dist/
+
+# Runtime config (personal paths / window geometry)
+.astronalyze_config.json
+.fitsview_config.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Claude internal
+.claude/

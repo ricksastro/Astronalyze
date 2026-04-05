@@ -1,0 +1,10 @@
+astropy>=5.0
+send2trash>=1.8
+matplotlib>=3.5
+numpy>=1.22
+photutils>=1.5
+scipy>=1.9
+PyQt6>=6.4
+pyqtgraph>=0.13
+# Optional — only needed for XISF support:
+# xisf>=0.9
