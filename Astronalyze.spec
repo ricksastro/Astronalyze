@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['scipy.spatial', 'scipy.interpolate', 'scipy.optimize', 'send2trash']
+hiddenimports = ['scipy.spatial', 'scipy.interpolate', 'scipy.optimize', 'scipy.ndimage', 'send2trash']
 tmp_ret = collect_all('astropy')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('photutils')

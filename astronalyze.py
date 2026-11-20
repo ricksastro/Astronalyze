@@ -6,6 +6,7 @@ Usage:
     python astronalyze.py [directory]
 """
 
+import fnmatch
 import json
 import os
 import re
@@ -495,6 +496,343 @@ def fit_star_fwhm(cutout: np.ndarray, cx_hint: float = None, cy_hint: float = No
         return None
 
 # ---------------------------------------------------------------------------
+# Donut-star collimation analysis
+# ---------------------------------------------------------------------------
+
+def detect_donuts(data: np.ndarray, det_sigma: float = 2.0,
+                  meas_sigma: float = 0.8, min_area: int = 80) -> list[dict]:
+    """Detect defocused donut stars (telescope with a central obstruction) and
+    measure how far each one's obstruction shadow sits off the center of its
+    bright ring.
+
+    Returns a list of dicts with keys 'x', 'y' (ring center, full-image px),
+    'dx', 'dy' (shadow displacement), 'offset_px', 'offset_pct', 'radius_px',
+    'inner_px', 'coverage'.
+
+    Detection and measurement deliberately use different amounts of smoothing.
+    Faint rings fragment into speckles at a global threshold, so detection runs
+    on a heavily smoothed copy that makes each ring a single blob; measuring on
+    that same copy would be wrong, because heavy smoothing washes out the
+    shadow and makes the answer depend on the smoothing width rather than on
+    the data. Measurement therefore uses a lightly smoothed copy.
+
+    Both centers are derived from *edges* — a half-power threshold followed by
+    the geometric centroid of a binary region — rather than from intensity
+    weighting, so uneven ring illumination does not drag them around.
+
+    Vignetted crescents and overlapping donut pairs — common off-axis, and
+    meaningless for collimation since their asymmetry has another cause — are
+    rejected by requiring a round, disk-like outline and a complete ring.
+    """
+    from scipy import ndimage
+
+    if data.ndim == 3:
+        work = (data[0] if data.shape[0] in (1, 3) and data.shape[0] < data.shape[1]
+                else data[:, :, 0]).astype(np.float32)
+    else:
+        work = data.astype(np.float32)
+    work = np.nan_to_num(work)
+    h, w = work.shape
+
+    _, median, std = sigma_clipped_stats(work, sigma=3.0)
+    median, std = float(median), float(std)
+    if std <= 0:
+        return []
+
+    det  = ndimage.gaussian_filter(work, sigma=det_sigma)
+    meas = ndimage.gaussian_filter(work, sigma=meas_sigma) if meas_sigma > 0 else work
+    del work
+
+    bright = det > (median + 3.0 * std)
+    labels, n = ndimage.label(bright, structure=np.ones((3, 3), dtype=bool))
+    if n == 0:
+        return []
+    areas = ndimage.sum(bright, labels, range(1, n + 1))
+    del bright, det
+
+    found = []
+    for i, sl in enumerate(ndimage.find_objects(labels), start=1):
+        if sl is None or areas[i - 1] < min_area:
+            continue
+        y_sl, x_sl = sl
+        if (y_sl.start <= 0 or x_sl.start <= 0
+                or y_sl.stop >= h or x_sl.stop >= w):
+            continue   # touches border — clipped donut, biased centroid
+
+        bh, bw = y_sl.stop - y_sl.start, x_sl.stop - x_sl.start
+        if max(bh, bw) / max(min(bh, bw), 1) > 1.25:
+            continue   # not round — crescent, blend, or elongated artefact
+
+        pad = 8
+        y0, y1 = max(0, y_sl.start - pad), min(h, y_sl.stop + pad)
+        x0, x1 = max(0, x_sl.start - pad), min(w, x_sl.stop + pad)
+        comp = labels[y0:y1, x0:x1] == i
+        crop = meas[y0:y1, x0:x1].astype(np.float64)
+
+        blob = ndimage.binary_fill_holes(comp)
+        # A round disk fills pi/4 (~0.785) of its bounding box; a crescent or
+        # a merged pair fills noticeably less, a boxy artefact more.
+        if not (0.68 <= blob.sum() / float(bw * bh) <= 0.92):
+            continue
+
+        # Modest defocus gives small donuts whose shadow spans only a few
+        # pixels, where a whole-pixel binary centroid is quantisation-limited.
+        # Resampling the crop recovers sub-pixel accuracy; `zoom` divides every
+        # length back out at the end, so all results stay in image pixels.
+        r_est = np.sqrt(blob.sum() / np.pi)
+        zoom = 4 if r_est < 10 else 2 if r_est < 20 else 1
+        if zoom > 1:
+            # grid_mode keeps the pixel grid aligned so a resampled coordinate
+            # maps back exactly as (c + 0.5) / zoom - 0.5, with no scale bias.
+            crop = ndimage.zoom(crop, zoom, order=3, grid_mode=True, mode='nearest')
+            blob = ndimage.zoom(blob.astype(np.float32), zoom, order=1,
+                                grid_mode=True, mode='nearest') > 0.5
+            if crop.size == 0 or not blob.any():
+                continue
+        # Robust percentile, not peak: tolerates faint rings and saturated cores.
+        ring_level = float(np.percentile(crop[blob], 80))
+        if ring_level <= median + 3.0 * std:
+            continue
+
+        # Outer edge at half power between sky and ring.
+        outer = crop > median + 0.5 * (ring_level - median)
+        ol, on = ndimage.label(outer, structure=np.ones((3, 3), dtype=bool))
+        if on == 0:
+            continue
+        osz = ndimage.sum(outer, ol, range(1, on + 1))
+        disk = ndimage.binary_fill_holes(ol == (int(np.argmax(osz)) + 1))
+        d_area = int(disk.sum())
+        if d_area < 50 * zoom * zoom:
+            continue
+        radius_px = float(np.sqrt(d_area / np.pi))
+        cy_o, cx_o = ndimage.center_of_mass(disk)
+
+        yy, xx = np.mgrid[0:crop.shape[0], 0:crop.shape[1]]
+        rr = np.hypot(xx - cx_o, yy - cy_o)
+
+        # The shadow must actually be dark relative to the ring — this is what
+        # separates a donut from an in-focus or solid star disk.
+        core = crop[rr < 0.30 * radius_px]
+        if core.size < 5:
+            continue
+        core_level = float(np.median(core))
+        if (ring_level - core_level) <= 0.30 * (ring_level - median):
+            continue
+
+        # Inner edge at half power between shadow core and ring.
+        shade = (crop < 0.5 * (core_level + ring_level)) & (rr < 0.85 * radius_px)
+        sl2, sn = ndimage.label(shade, structure=np.ones((3, 3), dtype=bool))
+        if sn == 0:
+            continue
+        which = sl2[int(round(cy_o)), int(round(cx_o))]
+        if which == 0:   # center pixel not in the shadow — take the largest piece
+            ssz = ndimage.sum(shade, sl2, range(1, sn + 1))
+            which = int(np.argmax(ssz)) + 1
+        shadow = sl2 == which
+        s_area = int(shadow.sum())
+        if s_area < 20 * zoom * zoom:
+            continue
+        inner_px = float(np.sqrt(s_area / np.pi))
+        if not (0.15 <= inner_px / radius_px <= 0.75):
+            continue
+        cy_i, cx_i = ndimage.center_of_mass(shadow)
+
+        # Ring must span all angles — an incomplete (vignetted) ring is not a
+        # valid collimation sample.
+        ring = disk & (crop > median + 0.45 * (ring_level - median)) & (rr > 0.55 * radius_px)
+        ry, rx = np.nonzero(ring)
+        if ry.size == 0:
+            continue
+        ang = np.arctan2(ry - cy_o, rx - cx_o)
+        coverage = float((np.histogram(ang, bins=36, range=(-np.pi, np.pi))[0] > 0).sum()) / 36.0
+        if coverage < 0.95:
+            continue
+
+        # Back to image pixels: offsets are a ratio so they are zoom-free, but
+        # every length and position must be divided out.
+        dx, dy = float(cx_i - cx_o) / zoom, float(cy_i - cy_o) / zoom
+        offset_px = float(np.hypot(dx, dy))
+        offset_pct = 100.0 * offset_px / (radius_px / zoom)
+        if offset_pct >= 40.0:
+            continue   # implausible for a real donut — misdetection
+
+        found.append({
+            'x': float(cx_o) / zoom + x0, 'y': float(cy_o) / zoom + y0,
+            'dx': dx, 'dy': dy,
+            'offset_px': offset_px, 'offset_pct': offset_pct,
+            'radius_px': radius_px / zoom, 'inner_px': inner_px / zoom,
+            'coverage': coverage,
+        })
+
+    if len(found) < 3:
+        return found
+
+    # Defocus is uniform across one exposure, so every genuine donut has nearly
+    # the same radius. Anything well off the median size is a misdetection.
+    med_r = float(np.median([d['radius_px'] for d in found]))
+    return [d for d in found if 0.80 * med_r <= d['radius_px'] <= 1.25 * med_r]
+
+
+def _solve_axis(x, y, dx, dy, sx, sy):
+    """Least-squares solve for where the shadow-offset vector field vanishes.
+    Returns (axis_x, axis_y, M, r2) or None when the gradient is degenerate."""
+    A = np.column_stack([np.ones_like(x), (x - sx) / sx, (y - sy) / sy])
+    cx, *_ = np.linalg.lstsq(A, dx, rcond=None)
+    cy, *_ = np.linalg.lstsq(A, dy, rcond=None)
+    M = np.array([[cx[1], cx[2]], [cy[1], cy[2]]])
+    if abs(np.linalg.det(M)) < 1e-9:
+        return None                      # gradient too flat to locate a zero
+    u, v = np.linalg.solve(M, -np.array([cx[0], cy[0]]))
+    resid = float(np.sum((dx - A @ cx) ** 2 + (dy - A @ cy) ** 2))
+    total = float(np.sum((dx - dx.mean()) ** 2 + (dy - dy.mean()) ** 2))
+    return (float(sx + u * sx), float(sy + v * sy), M,
+            float(1.0 - resid / max(total, 1e-12)))
+
+
+def fit_collimation_axis(donuts: list[dict], w: int, h: int,
+                         n_boot: int = 120) -> dict | None:
+    """Locate the optical axis — the field position where the obstruction
+    shadow sits centered in its ring, i.e. where collimation is best.
+
+    For a miscollimated scope the shadow displacement varies approximately
+    linearly across the field, so fitting that *vector* field and solving for
+    where it vanishes is far more robust than hunting the minimum of the
+    offset magnitude: it uses the direction of every measurement, it is not
+    biased by noise in the magnitude, and the fit quality (r2) says how much
+    the answer can be trusted. The solution may legitimately land outside the
+    frame, which means the axis misses the sensor entirely.
+
+    Returns {'x', 'y', 'r2', 'sigma', 'M', 'sx', 'sy'} or None if the fit is
+    degenerate. 'M' is the 2x2 Jacobian in normalised coordinates: shadow
+    offset ~= M @ ((p - axis) / (sx, sy)), so M^-1 maps a measured offset back
+    to the donut's displacement from the axis.
+
+    'sigma' is a bootstrap uncertainty on the axis position in pixels. It is
+    the honest reliability signal: r2 alone is misleading, because a handful of
+    donuts can fit a plane almost perfectly and still pin the axis nowhere
+    near the truth. Resampling exposes exactly that instability.
+    """
+    if len(donuts) < 6:
+        return None
+    sx, sy = w / 2.0, h / 2.0
+    x  = np.array([d['x']  for d in donuts])
+    y  = np.array([d['y']  for d in donuts])
+    dx = np.array([d['dx'] for d in donuts])
+    dy = np.array([d['dy'] for d in donuts])
+
+    base = _solve_axis(x, y, dx, dy, sx, sy)
+    if base is None:
+        return None
+    ax, ay, M, r2 = base
+
+    sigma = float('inf')
+    if n_boot > 0:
+        rng = np.random.default_rng(0)
+        n = len(x)
+        pts = []
+        for _ in range(n_boot):
+            i = rng.integers(0, n, n)
+            s = _solve_axis(x[i], y[i], dx[i], dy[i], sx, sy)
+            if s is not None:
+                pts.append((s[0], s[1]))
+        if len(pts) >= n_boot // 2:
+            p = np.asarray(pts)
+            med = np.median(p, axis=0)
+            # MAD rather than std: a few wild resamples should not dominate.
+            mad = np.median(np.abs(p - med), axis=0) * 1.4826
+            sigma = float(np.hypot(*mad))
+
+    return {'x': ax, 'y': ay, 'r2': r2, 'sigma': sigma,
+            'M': M, 'sx': sx, 'sy': sy}
+
+
+def arrows_toward_axis(donuts: list[dict], axis: dict) -> np.ndarray:
+    """For each donut, the pixel vector pointing from it toward the optical
+    axis, reconstructed from that donut's own measured shadow offset.
+
+    Inverting the fitted Jacobian turns a measured offset back into a
+    displacement from the axis, so these arrows are per-donut measurements
+    rather than lines drawn at a known answer: how tightly they converge is a
+    visual read on how consistent the data actually is.
+
+    Returns an (N, 2) array of (vx, vy) in pixels.
+    """
+    try:
+        m_inv = np.linalg.inv(axis['M'])
+    except np.linalg.LinAlgError:
+        return np.zeros((len(donuts), 2))
+    d = np.array([(x['dx'], x['dy']) for x in donuts])    # (N, 2)
+    uv = d @ m_inv.T                                       # displacement, normalised
+    return -uv * np.array([axis['sx'], axis['sy']])        # back toward the axis
+
+
+def _build_heatmap(pts_xy: np.ndarray, vals: np.ndarray, w: int, h: int,
+                    min_level_spacing: float = 0.2) -> tuple:
+    """Gaussian kernel regression (Nadaraya-Watson) of scattered (pts_xy, vals)
+    measurements onto a grid spanning (w, h): each grid point is a
+    distance-weighted average of all measurements, with bandwidth adapted to
+    measurement density. Returns (rgba, contour_paths, grid_z, GX, GY, vmin, vmax).
+
+    rgba is a green (low/good) -> red (high/bad) color field at [0,70] alpha.
+    contour_paths is a list of (level_value, Nx2 array) line segments, spaced
+    at least min_level_spacing apart in the same units as `vals`.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    grid_w = min(w, 300)
+    grid_h = min(h, 300)
+    gx = np.linspace(0, w, grid_w)
+    gy = np.linspace(0, h, grid_h)
+    GX, GY = np.meshgrid(gx, gy)
+    grid_pts = np.column_stack([GX.ravel(), GY.ravel()])
+
+    bandwidth = float(np.sqrt(w * h / max(len(vals), 1))) * 1.5
+    diff_x = grid_pts[:, 0:1] - pts_xy[:, 0]   # (n_grid, n_data)
+    diff_y = grid_pts[:, 1:2] - pts_xy[:, 1]
+    weights = np.exp(-0.5 * (diff_x ** 2 + diff_y ** 2) / bandwidth ** 2)
+    grid_z = (weights @ vals) / np.maximum(weights.sum(axis=1), 1e-10)
+    grid_z = grid_z.reshape(grid_h, grid_w)
+
+    # Light pixel-level blur to remove grid-sampling artefacts
+    grid_z = gaussian_filter(grid_z, sigma=3.0)
+
+    vmin = float(np.percentile(vals, 5))
+    vmax = float(np.percentile(vals, 95))
+    if vmax - vmin < 0.1:
+        vmin = vmax - 0.5
+
+    norm = np.clip((grid_z - vmin) / (vmax - vmin), 0.0, 1.0)
+
+    # Green (good/small) → yellow → red (bad/large)
+    r = np.clip(norm * 2.0 * 255, 0, 255).astype(np.uint8)
+    g = np.clip((1.0 - norm) * 2.0 * 255, 0, 255).astype(np.uint8)
+    b = np.zeros(grid_z.shape, dtype=np.uint8)
+    a = np.full(grid_z.shape, 70, dtype=np.uint8)
+    rgba = np.stack([r, g, b, a], axis=-1)
+
+    # Contour lines via matplotlib (library already required)
+    contour_paths = []
+    try:
+        from matplotlib.figure import Figure
+        import warnings
+        range_v = vmax - vmin
+        n_levels = max(1, min(5, int(range_v / max(min_level_spacing, 1e-6))))
+        levels = np.linspace(vmin, vmax, n_levels + 2)[1:-1]
+        fig = Figure()
+        ax  = fig.add_subplot(111)
+        cs  = ax.contour(GX, GY, grid_z, levels=levels)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            for lv, level_segs in zip(levels, cs.allsegs):
+                for seg in level_segs:
+                    if len(seg) > 1:
+                        contour_paths.append((float(lv), np.array(seg)))
+    except Exception:
+        pass   # overlay still shown without contours
+
+    return rgba, contour_paths, grid_z, GX, GY, vmin, vmax
+
+# ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
 
@@ -764,6 +1102,8 @@ class Astronalyze(QtWidgets.QMainWindow):
     _sig_map_msg         = QtCore.pyqtSignal(str)
     _sig_display         = QtCore.pyqtSignal(int, int, object)  # (gen, index, path) — queued load ready
     _sig_inspector_done  = QtCore.pyqtSignal(dict)   # {(row,col): fwhm_px or None}
+    _sig_collim_done     = QtCore.pyqtSignal(object, object, object, object)  # (rgba, contour_paths, donuts, best_info)
+    _sig_collim_msg      = QtCore.pyqtSignal(str)
 
     def __init__(self, start_path: str | None = None):
         super().__init__()
@@ -794,6 +1134,13 @@ class Astronalyze(QtWidgets.QMainWindow):
         self._inspector_fwhm_result: dict = {}   # {(row,col): [(img_x,img_y,fwhm_px),...]}
         self._inspector_regions: dict = {}        # {(row,col): (x0,y0,x1,y1)}
 
+        self._collim_visible:    bool = False
+        self._collim_computing:  bool = False
+        self._collim_best:       dict | None = None
+        self._collim_best_item  = None
+        self._collim_best_label = None
+        self._collim_arrow_item = None
+
         # Pre-fetch cache: keeps up to 3 images (current + neighbours) in RAM
         # so Next/Prev is instant after the first load.
         self._cache: OrderedDict[Path, tuple] = OrderedDict()
@@ -804,6 +1151,8 @@ class Astronalyze(QtWidgets.QMainWindow):
         self._files_default: list[Path] = []   # original directory sort order
         self._active_sort: str = 'default'   # 'default' | 'fwhm' | 'stars'
         self._sort_reversed: bool = False
+        self._filter_pattern: str = ''        # current wildcard filter ('' = no filter)
+        self._files_filtered: list[Path] = [] # files matching the active filter
 
         # Sequential navigation queue: one background thread loads in order,
         # each result is displayed via signal — no main-thread blocking ever.
@@ -818,6 +1167,8 @@ class Astronalyze(QtWidgets.QMainWindow):
         self._sig_map_msg.connect(self._on_map_msg)
         self._sig_display.connect(self._on_display_ready)
         self._sig_inspector_done.connect(self._show_inspector_fwhm)
+        self._sig_collim_done.connect(self._show_collimation)
+        self._sig_collim_msg.connect(self._on_collim_msg)
 
         self._build_ui()
         self._setup_shortcuts()
@@ -971,6 +1322,33 @@ class Astronalyze(QtWidgets.QMainWindow):
         rcol.setSpacing(2)
         rcol.setContentsMargins(0, 0, 0, 0)
 
+        # Quick filter buttons (L R G B S H O)
+        quick_row = QtWidgets.QHBoxLayout()
+        quick_row.setSpacing(2)
+        quick_row.setContentsMargins(0, 0, 0, 0)
+        self._quick_filter_btns: dict[str, QtWidgets.QPushButton] = {}
+        for label in ('L', 'R', 'G', 'B', 'S', 'H', 'O'):
+            btn = QtWidgets.QPushButton(label)
+            btn.setFixedWidth(26)
+            btn.clicked.connect(lambda checked, lbl=label: self._quick_filter(lbl))
+            quick_row.addWidget(btn)
+            self._quick_filter_btns[label] = btn
+        quick_row.addStretch()
+        rcol.addLayout(quick_row)
+
+        # Filter row
+        filter_row = QtWidgets.QHBoxLayout()
+        filter_row.setSpacing(2)
+        filter_row.setContentsMargins(0, 0, 0, 2)
+        self._filter_edit = QtWidgets.QLineEdit()
+        self._filter_edit.setPlaceholderText('Filter (e.g. *_R_*|*_Red_*)')
+        self._filter_edit.returnPressed.connect(self._apply_filter)
+        filter_row.addWidget(self._filter_edit, 1)
+        filter_row.addWidget(self._mk_btn('Filter', self._apply_filter))
+        self._btn_filter_clear = self._mk_btn('Clear', self._clear_filter)
+        filter_row.addWidget(self._btn_filter_clear)
+        rcol.addLayout(filter_row)
+
         sort_hdr = QtWidgets.QLabel('Sort')
         sort_hdr.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         rcol.addWidget(sort_hdr)
@@ -1048,6 +1426,8 @@ class Astronalyze(QtWidgets.QMainWindow):
         brow.addWidget(self._btn_inspector)
         self._btn_map = self._mk_btn('FWHM Map', self._toggle_fwhm_map)
         brow.addWidget(self._btn_map)
+        self._btn_collim = self._mk_btn('Collimation', self._toggle_collimation)
+        brow.addWidget(self._btn_collim)
         self._btn_map_color = self._mk_btn('Color', self._toggle_map_color)
         self._btn_map_color.hide()
         brow.addWidget(self._btn_map_color)
@@ -1059,6 +1439,8 @@ class Astronalyze(QtWidgets.QMainWindow):
         brow.addWidget(self._btn_fwhm_unit)
         self._lbl_fwhm = QtWidgets.QLabel('FWHM: —')
         brow.addWidget(self._lbl_fwhm)
+        self._lbl_collim = QtWidgets.QLabel('Collim: —')
+        brow.addWidget(self._lbl_collim)
         brow.addWidget(self._vsep())
         self._lbl_pixel = QtWidgets.QLabel('')
         brow.addWidget(self._lbl_pixel)
@@ -1129,6 +1511,8 @@ class Astronalyze(QtWidgets.QMainWindow):
             }}
             QListWidget::item:hover:!selected {{ background: #1e2a4a; }}
             QSplitter::handle {{ background: {TOOLBAR}; width: 3px; }}
+            QLineEdit#filter_active {{ background: #1a3a2a; color: {FG_ACCENT}; }}
+            QPushButton#quick_active {{ background: #1a4a80; color: {FG_ACCENT}; }}
         """)
         self._gview.setBackground(BG)
 
@@ -1234,6 +1618,12 @@ class Astronalyze(QtWidgets.QMainWindow):
         self._files_default = list(self._files)
         self._active_sort = None          # prevent reverse-on-open
         self._sort_reversed = False
+        self._filter_pattern = ''
+        self._files_filtered = []
+        self._filter_edit.clear()
+        self._filter_edit.setObjectName('')
+        self._filter_edit.style().unpolish(self._filter_edit)
+        self._filter_edit.style().polish(self._filter_edit)
         self._apply_sort('default', list(self._files), navigate=False)
         self._load_current(reset_view=True)
 
@@ -1303,12 +1693,119 @@ class Astronalyze(QtWidgets.QMainWindow):
         if navigate and self._files:
             self._load_current(reset_view=False)
 
+    def _get_base_files(self) -> list[Path]:
+        """Return the filtered file list when a filter is active, else the full default list."""
+        return self._files_filtered if self._filter_pattern else self._files_default
+
+    # Quick-filter button label -> spelled-out filter name also matched
+    _QUICK_FILTER_NAMES = {'L': 'Lum', 'R': 'Red', 'G': 'Green', 'B': 'Blue',
+                           'S': 'SII', 'H': 'Ha', 'O': 'OIII'}
+
+    @classmethod
+    def _quick_pattern(cls, label: str) -> str:
+        return f'*_{label}_*|*_{cls._QUICK_FILTER_NAMES[label]}_*'
+
+    @staticmethod
+    def _split_patterns(pattern: str) -> list[str]:
+        """Split a '|'-separated filter into lowercase glob patterns."""
+        return [p.strip().lower() for p in pattern.split('|') if p.strip()]
+
+    def _quick_filter(self, label: str):
+        pattern = self._quick_pattern(label)
+        self._filter_edit.setText(pattern)
+        # Highlight the active quick button, clear the rest
+        for lbl, btn in self._quick_filter_btns.items():
+            btn.setObjectName('quick_active' if lbl == label else '')
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+        self._apply_filter()
+
+    def _apply_filter(self):
+        pattern = self._filter_edit.text().strip()
+        # Deactivate quick buttons if the typed pattern doesn't match one of them
+        patterns = self._split_patterns(pattern)
+        expected_quick = [self._split_patterns(self._quick_pattern(lbl))
+                          for lbl in self._quick_filter_btns]
+        if patterns not in expected_quick:
+            for btn in self._quick_filter_btns.values():
+                btn.setObjectName('')
+                btn.style().unpolish(btn)
+                btn.style().polish(btn)
+        self._filter_pattern = pattern
+        if pattern:
+            self._files_filtered = [
+                f for f in self._files_default
+                if any(fnmatch.fnmatchcase(f.name.lower(), p) for p in patterns)
+            ]
+            if not self._files_filtered:
+                QtWidgets.QMessageBox.information(
+                    self, 'No matches', f'No files matched the pattern:\n{pattern}')
+                self._filter_pattern = ''
+                self._files_filtered = []
+                self._filter_edit.setObjectName('')
+                self._filter_edit.style().unpolish(self._filter_edit)
+                self._filter_edit.style().polish(self._filter_edit)
+                return
+            self._filter_edit.setObjectName('filter_active')
+        else:
+            self._files_filtered = []
+            self._filter_edit.setObjectName('')
+        self._filter_edit.style().unpolish(self._filter_edit)
+        self._filter_edit.style().polish(self._filter_edit)
+        self._reapply_sort_after_filter()
+
+    def _clear_filter(self):
+        self._filter_edit.clear()
+        self._filter_pattern = ''
+        self._files_filtered = []
+        self._filter_edit.setObjectName('')
+        self._filter_edit.style().unpolish(self._filter_edit)
+        self._filter_edit.style().polish(self._filter_edit)
+        for btn in self._quick_filter_btns.values():
+            btn.setObjectName('')
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+        self._reapply_sort_after_filter()
+
+    def _reapply_sort_after_filter(self):
+        """Re-run the active sort on the (now possibly filtered) base list, preserving direction."""
+        saved_sort = self._active_sort
+        saved_reversed = self._sort_reversed
+        self._active_sort = None   # prevent toggle-reverse logic in _apply_sort
+        self._sort_reversed = False
+        if saved_sort == 'fwhm':
+            self._sort_fwhm()
+        elif saved_sort == 'stars':
+            self._sort_stars()
+        else:
+            self._sort_default()
+        # Re-apply the previous reverse direction if it was active
+        if saved_reversed and self._files:
+            self._files = list(reversed(self._files))
+            self._sort_reversed = True
+            self._index = 0
+            self._nav_index = 0
+            # Update the active sort button label to show '−' prefix
+            _labels = {'default': 'Default', 'fwhm': 'FWHM', 'stars': 'Stars'}
+            for btn, name in ((self._btn_sort_default, 'default'),
+                              (self._btn_sort_fwhm,    'fwhm'),
+                              (self._btn_sort_stars,   'stars')):
+                if name == self._active_sort:
+                    btn.setText(f'\u2212{_labels[name]}')
+                    btn.style().unpolish(btn)
+                    btn.style().polish(btn)
+            self._populate_file_list()
+            self._lw_files.scrollToTop()
+            if self._files:
+                self._load_current(reset_view=False)
+
     def _sort_default(self):
-        self._apply_sort('default', list(self._files_default))
+        self._apply_sort('default', list(self._get_base_files()))
 
     def _sort_fwhm(self):
         _PAT = re.compile(r'FWHM([\d.]+)_', re.IGNORECASE)
-        matched = [f for f in self._files_default if _PAT.search(f.name)]
+        base = self._get_base_files()
+        matched = [f for f in base if _PAT.search(f.name)]
         if not matched:
             sample = self._files[0].name if self._files else '(no files)'
             QtWidgets.QMessageBox.information(
@@ -1321,11 +1818,12 @@ class Astronalyze(QtWidgets.QMainWindow):
         def fwhm_key(p: Path) -> float:
             m = _PAT.search(p.name)
             return float(m.group(1)) if m else float('inf')
-        self._apply_sort('fwhm', sorted(self._files_default, key=fwhm_key))
+        self._apply_sort('fwhm', sorted(base, key=fwhm_key))
 
     def _sort_stars(self):
         _PAT = re.compile(r'stars(\d+)_', re.IGNORECASE)
-        matched = [f for f in self._files_default if _PAT.search(f.name)]
+        base = self._get_base_files()
+        matched = [f for f in base if _PAT.search(f.name)]
         if not matched:
             sample = self._files[0].name if self._files else '(no files)'
             QtWidgets.QMessageBox.information(
@@ -1338,7 +1836,7 @@ class Astronalyze(QtWidgets.QMainWindow):
         def stars_key(p: Path) -> int:
             m = _PAT.search(p.name)
             return int(m.group(1)) if m else 999999
-        self._apply_sort('stars', sorted(self._files_default, key=stars_key))
+        self._apply_sort('stars', sorted(base, key=stars_key))
 
     def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
         """Intercept up/down arrow keys in the file list so they use the nav queue."""
@@ -1367,7 +1865,12 @@ class Astronalyze(QtWidgets.QMainWindow):
             return
         path = self._files[self._index]
         self._lbl_file.setText(str(path))
-        self._lbl_count.setText(f'{self._index + 1} / {len(self._files)}')
+        if self._filter_pattern:
+            self._lbl_count.setText(
+                f'{self._index + 1} / {len(self._files)}  '
+                f'[filtered: {len(self._files_filtered)} / {len(self._files_default)}]')
+        else:
+            self._lbl_count.setText(f'{self._index + 1} / {len(self._files)}')
         self._lw_files.blockSignals(True)
         self._lw_files.setCurrentRow(self._index)
         self._lw_files.blockSignals(False)
@@ -1377,6 +1880,7 @@ class Astronalyze(QtWidgets.QMainWindow):
             self._vb.removeItem(item)
         self._fwhm_label_items.clear()
         self._clear_fwhm_map()
+        self._clear_collimation()
         self._last_map_fwhm = None
 
         with self._cache_lock:
@@ -1580,6 +2084,8 @@ class Astronalyze(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, 'Missing library',
                 'scipy is required.\nRun:  pip install scipy')
             return
+        if self._collim_visible:
+            self._clear_collimation()
         self._map_computing = True
         self._btn_map.setEnabled(False)
         self._btn_map.setText('Computing…')
@@ -1733,64 +2239,9 @@ class Astronalyze(QtWidgets.QMainWindow):
             pts  = np.array([(p[0], p[1]) for p in fwhm_pts])
             vals = np.array([p[2]          for p in fwhm_pts])
 
-            # Gaussian kernel regression (Nadaraya-Watson): each grid point is
-            # a distance-weighted average of all measured FWHM values.
-            # Bandwidth adapts to star density — roughly 1.5× the typical
-            # inter-star spacing — so every grid point draws on several
-            # neighbouring measurements rather than being dominated by one.
-            from scipy.ndimage import gaussian_filter
-            grid_w = min(w, 300)
-            grid_h = min(h, 300)
-            gx = np.linspace(0, w, grid_w)
-            gy = np.linspace(0, h, grid_h)
-            GX, GY = np.meshgrid(gx, gy)
-            grid_pts = np.column_stack([GX.ravel(), GY.ravel()])
-
-            bandwidth = float(np.sqrt(w * h / max(len(fwhm_pts), 1))) * 1.5
-            diff_x = grid_pts[:, 0:1] - pts[:, 0]   # (n_grid, n_data)
-            diff_y = grid_pts[:, 1:2] - pts[:, 1]
-            weights = np.exp(-0.5 * (diff_x ** 2 + diff_y ** 2) / bandwidth ** 2)
-            grid_z = (weights @ vals) / np.maximum(weights.sum(axis=1), 1e-10)
-            grid_z = grid_z.reshape(grid_h, grid_w)
-
-            # Light pixel-level blur to remove grid-sampling artefacts
-            grid_z = gaussian_filter(grid_z, sigma=3.0)
-
-            fwhm_min = float(np.percentile(vals, 5))
-            fwhm_max = float(np.percentile(vals, 95))
-            if fwhm_max - fwhm_min < 0.1:
-                fwhm_min = fwhm_max - 0.5
-
-            norm = np.clip((grid_z - fwhm_min) / (fwhm_max - fwhm_min), 0.0, 1.0)
-
-            # Green (good/small) → yellow → red (bad/large)
-            r = np.clip(norm * 2.0 * 255, 0, 255).astype(np.uint8)
-            g = np.clip((1.0 - norm) * 2.0 * 255, 0, 255).astype(np.uint8)
-            b = np.zeros(grid_z.shape, dtype=np.uint8)
-            a = np.full(grid_z.shape, 70, dtype=np.uint8)
-            rgba = np.stack([r, g, b, a], axis=-1)
-
-            # Contour lines via matplotlib (library already required)
-            contour_paths = []
-            try:
-                from matplotlib.figure import Figure
-                import warnings
-                min_spacing_px = (0.2 / self._plate_scale
-                                  if self._plate_scale else 0.2)
-                range_px = fwhm_max - fwhm_min
-                n_levels = max(1, min(5, int(range_px / min_spacing_px)))
-                levels = np.linspace(fwhm_min, fwhm_max, n_levels + 2)[1:-1]
-                fig = Figure()
-                ax  = fig.add_subplot(111)
-                cs  = ax.contour(GX, GY, grid_z, levels=levels)
-                with warnings.catch_warnings():
-                    warnings.simplefilter('ignore')
-                    for lv, level_segs in zip(levels, cs.allsegs):
-                        for seg in level_segs:
-                            if len(seg) > 1:
-                                contour_paths.append((float(lv), np.array(seg)))
-            except Exception:
-                pass   # overlay still shown without contours
+            min_spacing_px = (0.2 / self._plate_scale if self._plate_scale else 0.2)
+            rgba, contour_paths, grid_z, GX, GY, _, _ = _build_heatmap(
+                pts, vals, w, h, min_level_spacing=min_spacing_px)
 
             avg_fwhm = float(np.median(grid_z))
             self._sig_map_done.emit(rgba, contour_paths, fwhm_pts, avg_fwhm)
@@ -1885,6 +2336,7 @@ class Astronalyze(QtWidgets.QMainWindow):
         self._inspector_active = not self._inspector_active
         if self._inspector_active:
             self._clear_fwhm_map()
+            self._clear_collimation()
             self._view_stack.setCurrentIndex(1)
             self._btn_inspector.setText('Close Inspector')
             self._btn_map.setText('FWHM')
@@ -2163,6 +2615,293 @@ class Astronalyze(QtWidgets.QMainWindow):
         self._btn_map.setText('FWHM Map')
         QtWidgets.QMessageBox.information(self, 'FWHM Map', msg)
 
+    # ------------------------------------------------------------------
+    # Collimation (donut-star) map
+    # ------------------------------------------------------------------
+
+    def _toggle_collimation(self):
+        if self._inspector_active:
+            QtWidgets.QMessageBox.information(self, 'Collimation', 'Close the Inspector first.')
+            return
+        if self._collim_visible:
+            self._clear_collimation()
+            return
+        if self._collim_computing:
+            return
+        if self._data is None:
+            QtWidgets.QMessageBox.information(self, 'No image', 'Load an image first.')
+            return
+        if not HAS_SCIPY:
+            QtWidgets.QMessageBox.critical(self, 'Missing library',
+                'scipy is required.\nRun:  pip install scipy')
+            return
+        if self._map_visible:
+            self._clear_fwhm_map()
+        self._collim_computing = True
+        self._btn_collim.setEnabled(False)
+        self._btn_collim.setText('Computing…')
+        threading.Thread(target=self._collimation_worker, daemon=True).start()
+
+    # Below this the shadow spans too few pixels to centroid even with
+    # resampling. On real frames small rings stay *systematically* biased —
+    # the fit can look tight and still put the axis far off — so this floor
+    # matters independently of the statistical checks below.
+    MIN_DONUT_RADIUS = 12.0
+    # The linear tilt model fits real data well whenever the donuts are big
+    # enough to measure; a poor fit means the offsets are mostly noise, which
+    # on real frames produces a confident-looking but badly wrong axis.
+    MIN_FIT_R2 = 0.75
+    # Bootstrap uncertainty on the axis, as a fraction of the frame diagonal.
+    # Catches the case r2 cannot: a few donuts fitting a plane well but
+    # pinning the axis nowhere near reliably.
+    MAX_AXIS_SIGMA = 0.05
+
+    def _collimation_worker(self):
+        try:
+            donuts = detect_donuts(self._data)
+            if len(donuts) < 6:
+                self._sig_collim_msg.emit(
+                    f'only {len(donuts)} donut star(s) found — need at least 6.\n\n'
+                    'Use a frame with more defocus so the rings are clearly '
+                    'separated from the background.')
+                return
+
+            h, w = self._get_image_hw()
+            med_r = float(np.median([d['radius_px'] for d in donuts]))
+            if med_r < self.MIN_DONUT_RADIUS:
+                self._sig_collim_msg.emit(
+                    f'donuts are too small (ring radius {med_r:.0f} px) — this '
+                    'frame is too close to focus to measure collimation.\n\n'
+                    'Defocus further, until the rings are at least 12 px in '
+                    'radius (20 px or more is better).')
+                return
+
+            pts  = np.array([(d['x'], d['y']) for d in donuts])
+            # Percentage of ring radius, not raw pixels: the raw offset scales
+            # with donut size, so in a frame whose defocus varies across the
+            # field (tilt) it would mark wherever donuts are smallest as "best".
+            vals = np.array([d['offset_pct'] for d in donuts])
+
+            rgba, contour_paths, grid_z, GX, GY, _, _ = _build_heatmap(
+                pts, vals, w, h, min_level_spacing=1.0)
+
+            axis = fit_collimation_axis(donuts, w, h)
+            if axis is None:
+                self._sig_collim_msg.emit(
+                    'shadow offsets show no usable gradient — cannot locate '
+                    'the optical axis in this frame.')
+                return
+            diag = float(np.hypot(w, h))
+            if axis['r2'] < self.MIN_FIT_R2 or axis['sigma'] > self.MAX_AXIS_SIGMA * diag:
+                why = ('too inconsistent' if axis['r2'] < self.MIN_FIT_R2
+                       else 'too unstable (too few usable donuts)')
+                self._sig_collim_msg.emit(
+                    f'shadow offsets are {why} to locate the axis '
+                    f'(fit {axis["r2"]:.2f}, uncertainty '
+                    f'{min(axis["sigma"], 99999):.0f} px).\n\nRing radius here '
+                    f'is {med_r:.0f} px. Defocus further — measurement gets '
+                    'reliable from about 15 px upward.')
+                return
+
+            arrows = arrows_toward_axis(donuts, axis)
+
+            dx_c, dy_c = axis['x'] - w / 2.0, axis['y'] - h / 2.0
+            best_info = {
+                'arrows': arrows,
+                'x': axis['x'], 'y': axis['y'], 'r2': axis['r2'],
+                'sigma': axis['sigma'],
+                'med_offset_pct': float(np.median(vals)),
+                'med_offset_px':  float(np.median([d['offset_px'] for d in donuts])),
+                'from_center_px': float(np.hypot(dx_c, dy_c)),
+                'off_frame': not (0 <= axis['x'] < w and 0 <= axis['y'] < h),
+                'n_donuts': len(donuts),
+                'radius_px': med_r,
+            }
+            self._sig_collim_done.emit(rgba, contour_paths, donuts, best_info)
+
+        except Exception as exc:
+            self._sig_collim_msg.emit(f'collimation error — {exc}')
+
+    def _show_collimation(self, rgba, contour_paths, donuts, best):
+        h, w = self._get_image_hw()
+        self._overlay_item.setImage(rgba, autoLevels=False)
+        self._overlay_item.setRect(QtCore.QRectF(0, 0, w, h))
+
+        for item in self._contour_items:
+            self._vb.removeItem(item)
+        self._contour_items.clear()
+        for item in self._contour_label_items:
+            self._vb.removeItem(item)
+        self._contour_label_items.clear()
+
+        from collections import defaultdict
+        level_segs: dict = defaultdict(list)
+        for lv, seg in contour_paths:
+            level_segs[lv].append(seg)
+
+        for lv, segs in level_segs.items():
+            for seg in segs:
+                curve = pg.PlotCurveItem(
+                    x=seg[:, 0], y=seg[:, 1],
+                    pen=pg.mkPen(color=(255, 255, 255, 160), width=1.0),
+                )
+                curve.setZValue(2)
+                curve.setVisible(self._map_contour_visible)
+                self._vb.addItem(curve)
+                self._contour_items.append(curve)
+
+            longest = max(segs, key=len)
+            mid = len(longest) // 2
+            lbl = pg.TextItem(text=f'{lv:.0f}%', color=(255, 255, 255, 220), anchor=(0.5, 0.5))
+            lbl.setZValue(3)
+            lbl.setPos(longest[mid, 0], longest[mid, 1])
+            lbl.setVisible(self._map_contour_visible)
+            self._vb.addItem(lbl)
+            self._contour_label_items.append(lbl)
+
+        self._scatter.setData(x=[d['x'] for d in donuts], y=[d['y'] for d in donuts])
+        self._draw_collim_arrows(donuts, best, w, h)
+
+        if self._collim_best_item is not None:
+            self._vb.removeItem(self._collim_best_item)
+        if self._collim_best_label is not None:
+            self._vb.removeItem(self._collim_best_label)
+
+        # The fitted axis can land outside the frame; keep the marker visible at
+        # the edge but report the true coordinates.
+        mx = float(np.clip(best['x'], 0, max(w - 1, 0)))
+        my = float(np.clip(best['y'], 0, max(h - 1, 0)))
+        self._collim_best_item = pg.ScatterPlotItem(
+            x=[mx], y=[my], symbol='+', size=26,
+            pen=pg.mkPen('#ffffff', width=2),
+            brush=pg.mkBrush(None),
+        )
+        self._collim_best_item.setZValue(5)
+        self._vb.addItem(self._collim_best_item)
+
+        note = '  (off frame)' if best['off_frame'] else ''
+        self._collim_best_label = pg.TextItem(
+            text=f"BEST COLLIMATION{note}\n({best['x']:.0f}, {best['y']:.0f})",
+            color='#ffffff', anchor=(0.5, 1.3),
+        )
+        self._collim_best_label.setZValue(5)
+        self._collim_best_label.setPos(mx, my)
+        self._vb.addItem(self._collim_best_label)
+
+        self._collim_best = best
+        # Small donuts stay systematically biased even when the fit is tight,
+        # so ring size caps the confidence regardless of r2 and sigma.
+        conf = 'good' if best['radius_px'] >= 15 else 'fair'
+        self._lbl_collim.setText(
+            f"Collim: best @ ({best['x']:.0f},{best['y']:.0f}) ±{best['sigma']:.0f}px "
+            f"— {best['from_center_px']:.0f}px off center   "
+            f"med Δ={best['med_offset_pct']:.1f}% of ring   "
+            f"n={best['n_donuts']}  R={best['radius_px']:.0f}px  "
+            f"fit {best['r2']:.2f} ({conf})"
+        )
+
+        self._collim_visible   = True
+        self._collim_computing = False
+        self._btn_collim.setEnabled(True)
+        self._btn_collim.setText('Hide Collimation')
+        self._map_color_visible   = True
+        self._map_contour_visible = True
+        self._btn_map_color.setText('No Color')
+        self._btn_map_color.show()
+        self._btn_map_contour.setText('No Contours')
+        self._btn_map_contour.show()
+        self._overlay_item.show()
+
+    def _draw_collim_arrows(self, donuts, best, w, h):
+        """Draw one arrow per donut pointing toward the best-collimated point.
+
+        All shafts and heads go into a single curve item with NaN breaks —
+        hundreds of separate arrow items would bog the view down.
+        """
+        if self._collim_arrow_item is not None:
+            self._vb.removeItem(self._collim_arrow_item)
+            self._collim_arrow_item = None
+
+        vecs = best.get('arrows')
+        if vecs is None or len(vecs) != len(donuts) or len(donuts) == 0:
+            return
+
+        lens = np.hypot(vecs[:, 0], vecs[:, 1])
+        longest = float(lens.max())
+        if longest <= 1e-9:
+            return
+
+        # Scale so the longest arrow is a readable fraction of the frame, and
+        # keep every arrow proportional to its own distance from the axis.
+        max_len = 0.07 * min(w, h)
+        scale = max_len / longest
+        head = 0.30
+
+        xs, ys = [], []
+        for d, (vx, vy) in zip(donuts, vecs):
+            L = float(np.hypot(vx, vy))
+            if L <= 1e-9:
+                continue
+            ex, ey = d['x'] + vx * scale, d['y'] + vy * scale
+            ux, uy = vx / L, vy / L
+            hl = L * scale * head
+            # shaft, then the two barbs, each as its own NaN-separated run
+            xs += [d['x'], ex, np.nan]
+            ys += [d['y'], ey, np.nan]
+            for sgn in (+1, -1):
+                bx = ex - hl * (ux * 0.866 - sgn * uy * 0.5)
+                by = ey - hl * (uy * 0.866 + sgn * ux * 0.5)
+                xs += [ex, bx, np.nan]
+                ys += [ey, by, np.nan]
+
+        if not xs:
+            return
+        item = pg.PlotCurveItem(
+            x=np.array(xs), y=np.array(ys), connect='finite',
+            pen=pg.mkPen(color=FG_ACCENT, width=1.5),
+        )
+        item.setZValue(4)
+        self._vb.addItem(item)
+        self._collim_arrow_item = item
+
+    def _clear_collimation(self):
+        self._overlay_item.show()
+        self._overlay_item.clear()
+        if self._collim_arrow_item is not None:
+            self._vb.removeItem(self._collim_arrow_item)
+            self._collim_arrow_item = None
+        for item in self._contour_items:
+            self._vb.removeItem(item)
+        self._contour_items.clear()
+        for item in self._contour_label_items:
+            self._vb.removeItem(item)
+        self._contour_label_items.clear()
+        self._scatter.clear()
+        if self._collim_best_item is not None:
+            self._vb.removeItem(self._collim_best_item)
+            self._collim_best_item = None
+        if self._collim_best_label is not None:
+            self._vb.removeItem(self._collim_best_label)
+            self._collim_best_label = None
+        self._collim_best = None
+        self._lbl_collim.setText('Collim: —')
+        self._btn_map_color.setText('No Color')
+        self._btn_map_color.hide()
+        self._btn_map_contour.setText('No Contours')
+        self._btn_map_contour.hide()
+        self._map_color_visible   = True
+        self._map_contour_visible = True
+        self._collim_visible   = False
+        self._collim_computing = False
+        self._btn_collim.setEnabled(True)
+        self._btn_collim.setText('Collimation')
+
+    def _on_collim_msg(self, msg: str):
+        self._collim_computing = False
+        self._btn_collim.setEnabled(True)
+        self._btn_collim.setText('Collimation')
+        QtWidgets.QMessageBox.information(self, 'Collimation', msg)
+
     def _show_fits_header(self):
         if not self._files or self._index >= len(self._files):
             return
@@ -2394,6 +3133,7 @@ class Astronalyze(QtWidgets.QMainWindow):
             self._cache.pop(path, None)
         self._files.pop(self._index)
         self._files_default = [f for f in self._files_default if f != path]
+        self._files_filtered = [f for f in self._files_filtered if f != path]
 
         if not self._files:
             self._data = None
@@ -2407,6 +3147,7 @@ class Astronalyze(QtWidgets.QMainWindow):
 
         if self._index >= len(self._files):
             self._index = len(self._files) - 1
+        self._nav_index = self._index
         self._populate_file_list()
         self._load_current()
 

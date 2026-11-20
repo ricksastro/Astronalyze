@@ -26,6 +26,7 @@ python -m PyInstaller --noconfirm --onedir --windowed ^
     --hidden-import scipy.spatial ^
     --hidden-import scipy.interpolate ^
     --hidden-import scipy.optimize ^
+    --hidden-import scipy.ndimage ^
     --hidden-import send2trash ^
     astronalyze.py
 
