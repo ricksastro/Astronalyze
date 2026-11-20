@@ -484,7 +484,9 @@ def fit_star_fwhm(cutout: np.ndarray, cx_hint: float = None, cy_hint: float = No
                 [0, x_lo, y_lo, 0.3, 0.3, -np.pi, -np.inf],
                 [np.inf, x_hi, y_hi, alpha_max, alpha_max, np.pi, np.inf],
             ),
-            maxfev=2000,
+            # A star that hasn't converged by now is noise-dominated; letting
+            # it run longer costs time and almost never yields a usable FWHM.
+            maxfev=400,
         )
         ax, ay = abs(popt[3]), abs(popt[4])
         if max(ax, ay) / max(min(ax, ay), 0.1) > 2.0:   # too elongated → double/blend
