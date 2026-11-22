@@ -1,6 +1,8 @@
 # Astronalyze User Guide
 
-Astronalyze is a fast astronomical image viewer for reviewing FITS and XISF sub-frames. It is designed for astrophotographers who need to quickly assess focus quality and seeing across many images.
+Astronalyze is a fast astronomical image viewer for reviewing FITS and XISF sub-frames. It is designed for astrophotographers who need to quickly assess focus quality, seeing and collimation across many images.
+
+This is the complete guide. The [README](README.md) on GitHub is a short quick start.
 
 ---
 
@@ -33,8 +35,10 @@ Astronalyze is a fast astronomical image viewer for reviewing FITS and XISF sub-
 - No Python installation required when using the `.exe` build
 
 ### Installation
-1. Copy the entire `Astronalyze\` folder to any location on your machine.
-2. Run `register.bat` **as Administrator** once to associate `.fits`, `.fit`, `.fts`, and `.xisf` files with Astronalyze. After registration you can double-click any of those files in Explorer to open them directly.
+1. Download `Astronalyze.zip` from the latest release: https://github.com/ricksastro/Astronalyze/releases/latest
+2. Right-click the zip and select **Extract All…**. This creates an `Astronalyze\` folder containing `Astronalyze.exe` and its support files. Nothing else needs to be installed.
+3. Double-click `Astronalyze.exe` to run it. The first launch may take several seconds.
+4. Optional: run `register.bat` **as Administrator** once to associate `.fits`, `.fit`, `.fts`, and `.xisf` files with Astronalyze (see [File Association](#17-file-association)).
 
 ---
 
@@ -317,7 +321,7 @@ Astronalyze saves the following settings automatically to `.astronalyze_config.j
 
 ## 17. File Association
 
-Run `dist\Astronalyze\register.bat` **as Administrator** to register Astronalyze as the default application for:
+Run `register.bat` (in the `Astronalyze\` folder) **as Administrator** to register Astronalyze as the default application for:
 
 | Extension | Type |
 |-----------|------|
