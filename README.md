@@ -2,7 +2,7 @@ Please see the Astronalyze_User_Guide.md for a complete guide to using this tool
 
 To install, download Astronalyze.zip from the release folder below to a folder on your hard drive.  Right-click and select Extract All...
 
-https://github.com/ricksastro/Astronalyze/releases/tag/v1.0.0
+https://github.com/ricksastro/Astronalyze/releases/latest
 
 This will create an Astronalyze folder with Astronalyze.exe in it as well as other support files.   No need to install anything!
 
